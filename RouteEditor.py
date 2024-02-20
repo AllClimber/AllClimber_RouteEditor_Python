@@ -1,72 +1,133 @@
 import cv2
 import numpy as np
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
 
-def extract_holds(image_path, hold_color_lower, hold_color_upper):
-    # 이미지를 읽어옴
-    image = cv2.imread(image_path)
 
-    # BGR을 HSV로 변환
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+class ImageAdjustor:
+    # image 는 HSV 색체계여야 한다.
+    def adjust_brightness(self, image, brightness):
+        image[:, :, 2] = np.clip(image[:, :, 2] + brightness, 0, 255)
+        return image
+    
+    # image 는 HSV 색체계여야 한다.
+    def adjust_saturation(self, image, satruation):
+        image[:, :, 1] = np.clip(image[:, :, 1] + satruation, 0, 255)
+        return image
 
-    # 지정한 범위 내의 색상만 유지
-    mask = cv2.inRange(hsv, hold_color_lower, hold_color_upper)
-    holds_colored = cv2.bitwise_and(image, image, mask=mask)
+    # 평활화 (노이즈 감소, 색의 경계를 부드럽게 하면서 일관된 영역은 강조)
+    def shift(self, image, sp, sr):
+        return cv2.pyrMeanShiftFiltering(image, sp=sp, sr=sr)
+    
+    # 블러 처리 (노이즈를 제거)
+    def blur(self, image, ksize, sigmaX):
+        return cv2.GaussianBlur(image, ksize, sigmaX)
 
-    # 그 외의 부분을 흑백으로 처리
-    holds_gray = cv2.cvtColor(holds_colored, cv2.COLOR_BGR2GRAY)
+    # 엣지 강조 (3*3 단위의 커널을 이미지에 적용하여 미분하여 경계를 강조한다.)
+    def enhance_edges(self, image):
+        kernel = np.array([[-1, -1, -1],
+                        [-1,  8, -1],
+                        [-1, -1, -1]])
+        edges = cv2.filter2D(image, -1, kernel)
+        return cv2.addWeighted(image, 1, edges, 1.5, 0)
 
-    # 흑백 이미지에서 홀드의 경계 검출
-    edges = cv2.Canny(holds_gray, 30, 100)
+    def extract_holds(self, image):
+        # 컨투어 추출 (윤곽선을 추출해서 연결된 객체로 인식되는 것들을 감싸는 사각형을 만드는 듯?)
+        edges = cv2.Canny(image, 50, 150, L2gradient=False)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_contour_size = 15
+        filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_contour_size]
+        return [cv2.boundingRect(contour) for contour in filtered_contours]
 
-    # 경계 추출
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def indicate_holds(self, image, holds):
+        # 원본이미지에 컨투어 표시
+        hold_indicated_image = image.copy()
+        for hold in holds:
+            cv2.rectangle(hold_indicated_image, (hold[0], hold[1]), (hold[0] + hold[2], hold[1] + hold[3]), (0, 255, 0), 2)
+        return hold_indicated_image
 
-    # 홀드 정보를 담을 리스트
-    holds_info = []
+    def resize(self, image, target_width):
+        # resize
+        width = image.shape[1]
+        height = image.shape[0]
+        scale_factor = target_width / width
+        target_height = int(height*scale_factor)
+        return cv2.resize(image, (target_width, target_height), cv2.COLOR_BGR2RGB)
 
-    for contour in contours:
-        # 너무 작은 객체는 무시
-        if cv2.contourArea(contour) > min_contour_area:
-            # 경계 상자를 추출
-            x, y, w, h = cv2.boundingRect(contour)
+    def adjust_image(self, original_image, brightness, satruation):
+        hsv_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2HSV)
+        brightness_image = self.adjust_brightness(hsv_image, brightness)
+        saturation_image = self.adjust_saturation(brightness_image, satruation)
+        shifted_image = self.shift(saturation_image, 15, 50)
 
-            # 홀드 색상 추출
-            hold_roi = holds_colored[y:y+h, x:x+w]
-            avg_color = np.mean(hold_roi, axis=(0, 1)).astype(int)
-            representative_color = tuple(avg_color.tolist())
+        # 그레이스케일로 변환 (픽셀당 하나의 값만을 가지므로 색상 정보를 유지하면서도 연산량을 감소시킴)
+        bgrImage = cv2.cvtColor(shifted_image, cv2.COLOR_HSV2BGR)
+        gray_image = cv2.cvtColor(bgrImage, cv2.COLOR_BGR2GRAY)
+        blurred_image = self.blur(gray_image, (1, 1), 0)
+        edge_enhanced_image = self.enhance_edges(blurred_image)
+        holds = self.extract_holds(edge_enhanced_image)
+        hold_indicated_image = self.indicate_holds(original_image, holds)
 
-            # 홀드 정보를 리스트에 추가
-            holds_info.append({'x': x, 'y': y, 'width': w, 'height': h, 'color': representative_color})
+        return np.concatenate((
+            cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(brightness_image, cv2.COLOR_HSV2RGB),
+            cv2.cvtColor(saturation_image, cv2.COLOR_HSV2RGB),
+            cv2.cvtColor(shifted_image, cv2.COLOR_HSV2RGB),
+            cv2.cvtColor(blurred_image, cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(edge_enhanced_image, cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(hold_indicated_image, cv2.COLOR_BGR2RGB)
+        ), axis=1)
 
-    return holds_info, holds_gray
+class ImageAdjustmentApp:
 
-# 이미지 파일 경로
-image_path = '/Users/user/project/all_climber/route_edit_python/sampleImages/bouldering_wall_1.webp'
+    def __init__(self, root, image_path):
+        self.root = root
+        self.root.title("Image Adjustment App")
 
-# 원하는 홀드의 색상 범위 지정 (HSV 값으로)
-hold_color_lower = np.array([30, 10, 30], dtype=np.uint8)
-hold_color_upper = np.array([50, 50, 50], dtype=np.uint8)
+        self.original_image = cv2.imread(image_path)
 
-# 최소 경계 넓이
-min_contour_area = 100
+        self.create_widgets()
+        self.update_images()
 
-# 홀드 정보 추출 및 색상 추출
-holds_info, holds_gray = extract_holds(image_path, hold_color_lower, hold_color_upper)
+    def create_widgets(self):
+        self.processed_image_label = ttk.Label(self.root)
+        self.processed_image_label.pack()
 
-# 색상이 추출된 홀드 정보 출력
-for i, hold in enumerate(holds_info):
-    print(f"Hold {i + 1}: {hold['color']}")
+        brightness_label = ttk.Label(self.root, text="Brightness")
+        brightness_label.pack()
+        self.brightness_slider = ttk.Scale(self.root, from_=-100, to=100)
+        self.brightness_slider.set(0)
+        self.brightness_slider.pack()
 
-# 특정 색상의 홀드만 남기고 나머지는 흑백처리
-desired_color = (40, 20,20)  # 예시로 초록색 (BGR 순서)
-filtered_holds_gray = np.zeros_like(holds_gray)
+        saturation_label = ttk.Label(self.root, text="Saturation")
+        saturation_label.pack()
+        self.saturation_slider = ttk.Scale(self.root, from_=-100, to=100)
+        self.saturation_slider.set(0)
+        self.saturation_slider.pack()
 
-for hold in holds_info:
-    if hold['color'] == desired_color:
-        x, y, w, h = hold['x'], hold['y'], hold['width'], hold['height']
-        filtered_holds_gray[y:y+h, x:x+w] = holds_gray[y:y+h, x:x+w]
+        # Update 버튼 추가
+        update_button = ttk.Button(self.root, text="Update", command=self.update_images)
+        update_button.pack()
 
-# 결과 표시
-cv2.imshow('Filtered Holds', filtered_holds_gray)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+    def adjust_image(self):
+        image_adjuster = ImageAdjustor()
+        brightness_value = self.brightness_slider.get()
+        saturation_value = self.saturation_slider.get()
+        adjusted_image_set = image_adjuster.adjust_image(self.original_image, brightness_value, saturation_value)
+        return image_adjuster.resize(adjusted_image_set, 1600)
+
+    def update_images(self):
+        final_image = self.adjust_image()
+
+        # Show final image
+        final_image = Image.fromarray(final_image)
+        photo = ImageTk.PhotoImage(image=final_image)
+        self.processed_image_label.config(image=photo)
+        self.processed_image_label.image = photo
+
+# GUI application execution
+root = tk.Tk()
+image_path = "sampleImages/bouldering_wall_1.webp"
+app = ImageAdjustmentApp(root, image_path)
+root.mainloop()
